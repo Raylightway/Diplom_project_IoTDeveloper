@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>IoT Dashboard - Optimized</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1 { color: white; text-align: center; margin-bottom: 20px; font-size: 2em; }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 12px;
+            padding: 15px;
+            text-align: center;
+            color: white;
+        }
+        .stat-value { font-size: 2em; font-weight: bold; }
+        .stat-label { margin-top: 5px; font-size: 0.8em; opacity: 0.9; }
+        .controls {
+            background: rgba(255,255,255,0.1);
+            border-radius: 12px;
+            padding: 15px;
+            margin-bottom: 20px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .controls label { color: white; font-weight: bold; }
+        select, button {
+            padding: 8px 15px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        select { background: white; color: #333; }
+        button { background: #667eea; color: white; }
+        button:hover { background: #764ba2; }
+        .chart-container {
+            background: white;
+            border-radius: 12px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+        .chart-title {
+            font-size: 1.1em;
+            font-weight: bold;
+            margin-bottom: 15px;
+            color: #333;
+            border-left: 3px solid #667eea;
+            padding-left: 12px;
+        }
+        .chart-wrapper { position: relative; height: 350px; width: 100%; }
+        canvas { display: block; width: 100%; height: 100%; }
+        .legend {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 12px;
+            padding: 10px;
+            background: #f5f5f5;
+            border-radius: 8px;
+            justify-content: center;
+            font-size: 11px;
+        }
+        .legend-item { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+        .legend-color { width: 16px; height: 16px; border-radius: 3px; }
+        .status {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 15px;
+            font-size: 11px;
+            margin-left: auto;
+        }
+        .status-ok { background: #4CAF50; color: white; }
+        .status-loading { background: #FF9800; color: white; }
+        .refresh-info {
+            text-align: center;
+            color: rgba(255,255,255,0.7);
+            margin-top: 15px;
+            font-size: 11px;
+        }
+        @media (max-width: 768px) {
+            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+            .chart-wrapper { height: 250px; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>📊 IoT Data Dashboard</h1>
+    
+    <div class="stats-grid">
+        <div class="stat-card"><div class="stat-value" id="totalReadings">-</div><div class="stat-label">Total Readings</div></div>
+        <div class="stat-card"><div class="stat-value" id="avgValue">-</div><div class="stat-label">Global Average</div></div>
+        <div class="stat-card"><div class="stat-value" id="totalDevices">-</div><div class="stat-label">Active Devices</div></div>
+        <div class="stat-card"><div class="stat-value" id="lastUpdate">-</div><div class="stat-label">Last Update</div></div>
+    </div>
+
+    <div class="controls">
+        <label>📅 Time:</label>
+        <select id="timeRange">
+            <option value="1">1 Hour</option>
+            <option value="6" selected>6 Hours</option>
+            <option value="24">24 Hours</option>
+        </select>
+        <button id="refreshBtn">🔄 Refresh</button>
+        <span id="status" class="status status-ok">Connected</span>
+    </div>
+
+    <div class="chart-container">
+        <div class="chart-title">📈 Device Trends (Rolling Average)</div>
+        <div class="chart-wrapper">
+            <canvas id="trendChart"></canvas>
+        </div>
+        <div id="trendLegend" class="legend"></div>
+    </div>
+
+    <div class="chart-container">
+        <div class="chart-title">📊 Average by Device</div>
+        <div class="chart-wrapper">
+            <canvas id="avgChart"></canvas>
+        </div>
+    </div>
+
+    <div class="refresh-info">
+        🔄 Updates every 60 seconds
+    </div>
+</div>
+
+<script>
+// Оптимизированная версия - меньше графиков, реже обновление
+const API_URL = 'https://d5dga2o3nn7ra0o9gv38.kocrdvxt.apigw.yandexcloud.net';
+let trendChart = null;
+let avgChart = null;
+
+const colors = ['#667eea', '#764ba2', '#4CAF50', '#FF9800', '#f44336', '#2196F3', '#9C27B0'];
+
+let updateTimer = null;
+let isLoading = false;
+
+function updateStatus(ok, msg) {
+    const el = document.getElementById('status');
+    el.textContent = msg;
+    el.className = 'status ' + (ok ? 'status-ok' : 'status-loading');
+}
+
+// Функция для ограничения количества точек данных (оптимизация)
+function downsampleData(data, maxPoints) {
+    if (data.length <= maxPoints) return data;
+    const step = Math.ceil(data.length / maxPoints);
+    const result = [];
+    for (let i = 0; i < data.length; i += step) {
+        result.push(data[i]);
+    }
+    return result;
+}
+
+function groupByDevice(timeline) {
+    const groups = {};
+    for (let i = 0; i < timeline.length; i++) {
+        const item = timeline[i];
+        const device = item.device_id;
+        if (!groups[device]) groups[device] = [];
+        groups[device].push({
+            time: new Date(item.timestamp),
+            value: item.value
+        });
+    }
+    return groups;
+}
+
+function computeRollingAverage(data, windowSize) {
+    const result = [];
+    for (let i = 0; i < data.length; i++) {
+        let start = Math.max(0, i - windowSize);
+        let end = Math.min(data.length - 1, i + windowSize);
+        let sum = 0;
+        let count = 0;
+        for (let j = start; j <= end; j++) {
+            sum += data[j].value;
+            count++;
+        }
+        result.push({
+            x: data[i].time,
+            y: sum / count
+        });
+    }
+    return result;
+}
+
+function drawTrendChart(timeline) {
+    const canvas = document.getElementById('trendChart');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (trendChart) {
+        trendChart.destroy();
+        trendChart = null;
+    }
+    if (!timeline || timeline.length === 0) return;
+    
+    const groups = groupByDevice(timeline);
+    const devices = Object.keys(groups);
+    const datasets = [];
+    const legendItems = [];
+    
+    for (let i = 0; i < Math.min(devices.length, 8); i++) {
+        const device = devices[i];
+        let data = groups[device];
+        data.sort((a, b) => a.time - b.time);
+        
+        // Ограничиваем количество точек для производительности
+        const downsampled = downsampleData(data, 200);
+        const averaged = computeRollingAverage(downsampled, 2);
+        const color = colors[i % colors.length];
+        
+        datasets.push({
+            label: device,
+            data: averaged,
+            borderColor: color,
+            borderWidth: 1.5,
+            fill: false,
+            tension: 0.1,
+            pointRadius: 0
+        });
+        legendItems.push({ name: device, color: color });
+    }
+    
+    if (datasets.length === 0) return;
+    
+    trendChart = new Chart(ctx, {
+        type: 'line',
+        data: { datasets: datasets },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            animation: false, // Отключаем анимацию для производительности
+            plugins: { 
+                legend: { display: false },
+                tooltip: { enabled: true, mode: 'index' }
+            },
+            scales: {
+                x: {
+                    type: 'time',
+                    time: { 
+                        displayFormats: { minute: 'HH:mm', hour: 'HH:mm' },
+                        tooltipFormat: 'HH:mm'
+                    },
+                    ticks: { maxRotation: 30, autoSkip: true, maxTicksLimit: 8 }
+                },
+                y: { beginAtZero: true, ticks: { maxTicksLimit: 6 } }
+            }
+        }
+    });
+    
+    const legendDiv = document.getElementById('trendLegend');
+    legendDiv.innerHTML = '';
+    for (let i = 0; i < legendItems.length; i++) {
+        legendDiv.innerHTML += '<div class="legend-item" onclick="toggleTrend(' + i + ')"><div class="legend-color" style="background:' + legendItems[i].color + '"></div><span>' + legendItems[i].name + '</span></div>';
+    }
+}
+
+function drawAvgChart(deviceStats) {
+    const canvas = document.getElementById('avgChart');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (avgChart) {
+        avgChart.destroy();
+        avgChart = null;
+    }
+    if (!deviceStats || Object.keys(deviceStats).length === 0) return;
+    
+    const devices = Object.keys(deviceStats);
+    const averages = [];
+    const bgColors = [];
+    
+    for (let i = 0; i < Math.min(devices.length, 10); i++) {
+        averages.push(deviceStats[devices[i]].avg);
+        bgColors.push(colors[i % colors.length]);
+    }
+    
+    avgChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: devices.slice(0, 10),
+            datasets: [{ label: 'Average', data: averages, backgroundColor: bgColors, borderRadius: 6 }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            animation: false,
+            plugins: { legend: { display: false } },
+            scales: { y: { beginAtZero: true, ticks: { maxTicksLimit: 6 } } }
+        }
+    });
+}
+
+function toggleTrend(index) {
+    if (trendChart && trendChart.data.datasets[index]) {
+        const meta = trendChart.getDatasetMeta(index);
+        meta.hidden = !meta.hidden;
+        trendChart.update();
+    }
+}
+
+async function loadData() {
+    if (isLoading) return;
+    isLoading = true;
+    
+    const hours = document.getElementById('timeRange').value;
+    updateStatus(true, 'Loading...');
+    
+    try {
+        const url = API_URL + '/api/data?hours=' + hours;
+        const response = await fetch(url);
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const data = await response.json();
+        
+        document.getElementById('totalReadings').textContent = data.stats.total || 0;
+        document.getElementById('avgValue').textContent = (data.stats.average || 0).toFixed(1);
+        document.getElementById('totalDevices').textContent = data.stats.devices || 0;
+        document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+        
+        if (data.timeline && data.timeline.length > 0) {
+            drawTrendChart(data.timeline);
+        }
+        
+        if (data.device_stats && Object.keys(data.device_stats).length > 0) {
+            drawAvgChart(data.device_stats);
+        }
+        
+        updateStatus(true, 'OK');
+    } catch (error) {
+        console.error('Error:', error);
+        updateStatus(false, 'Error');
+    } finally {
+        isLoading = false;
+    }
+}
+
+// Функция для очистки ресурсов
+function cleanup() {
+    if (trendChart) {
+        trendChart.destroy();
+        trendChart = null;
+    }
+    if (avgChart) {
+        avgChart.destroy();
+        avgChart = null;
+    }
+    if (updateTimer) {
+        clearInterval(updateTimer);
+        updateTimer = null;
+    }
+}
+
+// Инициализация
+document.getElementById('refreshBtn').onclick = function() {
+    cleanup();
+    loadData();
+};
+
+document.getElementById('timeRange').onchange = function() {
+    cleanup();
+    loadData();
+};
+
+loadData();
+// Обновление раз в минуту вместо 30 секунд
+updateTimer = setInterval(function() {
+    cleanup();
+    loadData();
+}, 60000);
+
+// Очистка при закрытии страницы
+window.addEventListener('beforeunload', cleanup);
+</script>
+</body>
+</html>

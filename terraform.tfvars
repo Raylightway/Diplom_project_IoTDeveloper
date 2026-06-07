@@ -1,3 +1,5 @@
+# terraform.tfvars
+
 yc_token       = "y0__wgBEL_MkYEHGMHdEyDk2p7NFzCq_caKCARmQKMUCzu8OAFJ5P8v9Y9E6Sbc"
 yc_cloud_id  = "b1ghaldh06m42l069n7r"
 yc_folder_id = "b1gm4i273dt3chocgk63"
