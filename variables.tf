@@ -6,6 +6,7 @@ variable "yc_folder_id" {}
 variable "bucket_name" {}
 variable "function_name" {}
 variable "database_name" {}
+
 variable "storage_endpoint" {
   description = "Endpoint URL for Yandex Object Storage"
   type        = string
@@ -92,4 +93,18 @@ variable "db_assign_public_ip" {
   description = "Whether to assign public IP to database host"
   type        = bool
   default     = true
+}
+
+variable "mqtt_username" {
+  description = "MQTT broker username (optional)"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "mqtt_password" {
+  description = "MQTT broker password (optional)"
+  type        = string
+  default     = ""
+  sensitive   = true
 }

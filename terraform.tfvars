@@ -14,4 +14,5 @@ db_environment        = "PRODUCTION"
 db_user_name         = "app_dbuser"
 db_user_password     = "password"
 db_assign_public_ip  = true
-
+mqtt_username      = "mqtt_user"
+mqtt_password      = "secure_password_123"

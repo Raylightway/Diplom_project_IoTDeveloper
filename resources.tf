@@ -13,6 +13,13 @@ resource "yandex_vpc_subnet" "db_subnet_a" {
   v4_cidr_blocks = ["10.0.1.0/24"]
 }
 
+resource "yandex_vpc_subnet" "vm_subnet_a" {
+  name           = "vm-subnet-a"
+  zone           = var.zone
+  network_id     = yandex_vpc_network.iot_network.id
+  v4_cidr_blocks = ["10.0.10.0/24"]
+}
+
 # ============================================
 # КЛАСТЕР POSTGRESQL
 # ============================================
@@ -92,6 +99,12 @@ resource "yandex_iam_service_account" "api_gateway_sa" {
   description = "Service account for API Gateway"
 }
 
+# Сервисный аккаунт для машины с MOSQUITTO (MQTT)
+resource "yandex_iam_service_account" "vm_sa" {
+  name        = "vm-sa"
+  description = "Service account for MQTT VM"
+}
+
 # ============================================
 # СТАТИЧЕСКИЕ КЛЮЧИ ДОСТУПА
 # ============================================
@@ -133,6 +146,46 @@ resource "yandex_resourcemanager_folder_iam_member" "function_self_invoke" {
 }
 
 # ============================================
+# ГРУППА БЕЗОПАСНОСТИ ДЛЯ MQTT
+# ============================================
+
+resource "yandex_vpc_security_group" "mqtt_sg" {
+  name       = "mqtt-security-group"
+  network_id = yandex_vpc_network.iot_network.id
+
+  # Входящий трафик на MQTT
+  ingress {
+    description    = "MQTT Standard Port"
+    protocol       = "TCP"
+    port           = 1883
+    v4_cidr_blocks = ["0.0.0.0/0"] # Лучше ограничить IP клиентов в продакшене
+  }
+
+  # Входящий трафик на MQTT WebSocket
+  ingress {
+    description    = "MQTT WebSocket"
+    protocol       = "TCP"
+    port           = 9001
+    v4_cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # SSH доступ (рекомендуется только с вашего IP)
+  ingress {
+    description    = "SSH"
+    protocol       = "TCP"
+    port           = 22
+    v4_cidr_blocks = ["0.0.0.0/0"] # Замените на ваш IP: "x.x.x.x/32"
+  }
+
+  # Исходящий трафик разрешен весь
+  egress {
+    description    = "Allow all outbound"
+    protocol       = "ANY"
+    v4_cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# ============================================
 # СОЗДАНИЕ ZIP АРХИВОВ ДЛЯ ФУНКЦИЙ
 # ============================================
 
@@ -141,6 +194,13 @@ data "archive_file" "functions_zip" {
   type        = "zip"
   source_dir  = "${path.module}/functions"
   output_path = "${path.module}/functions.zip"
+}
+
+# Создаем zip архив для MQTT эмулятора
+data "archive_file" "mqtt_emulator_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/mqtt_emulator"
+  output_path = "${path.module}/mqtt_emulator.zip"
 }
 
 # ============================================
@@ -172,6 +232,29 @@ resource "yandex_function" "data_processor" {
     AVERAGING_INTERVAL_MINUTES   = var.averaging_interval_minutes
     AWS_ACCESS_KEY_ID            = yandex_iam_service_account_static_access_key.function_keys.access_key
     AWS_SECRET_ACCESS_KEY        = yandex_iam_service_account_static_access_key.function_keys.secret_key
+  }
+}
+
+# Функция эмулятора MQTT
+resource "yandex_function" "mqtt_emulator" {
+  name = "mqtt-emulator"
+
+  runtime            = "python311"
+  entrypoint         = "mqtt_emulator.handler"
+  memory             = "128"
+  execution_timeout  = "120"
+  user_hash          = data.archive_file.mqtt_emulator_zip.output_base64sha256
+  service_account_id = yandex_iam_service_account.function_sa.id
+
+  content {
+    zip_filename = data.archive_file.mqtt_emulator_zip.output_path
+  }
+
+  environment = {
+    MQTT_HOST     = yandex_compute_instance.mqtt_broker.network_interface[0].nat_ip_address
+    MQTT_PORT     = "1883"
+    MQTT_USERNAME = var.mqtt_username
+    MQTT_PASSWORD = var.mqtt_password
   }
 }
 
@@ -211,6 +294,171 @@ resource "yandex_function_trigger" "timer_trigger" {
   }
 }
 
+# Триггер для автоматической эмуляции
+resource "yandex_function_trigger" "mqtt_emulation_trigger" {
+  count = 1
+  
+  name = "mqtt-emulation-trigger"
+
+  timer {
+    cron_expression = "*/1 * * * ? *"  # Каждые 2 минуты
+    payload = jsonencode({
+      devices     = ["Device_1", "Device_2","Device_3","Device_4"]
+      count       = 5
+      interval    = 0.5
+      value_range = [0, 100]
+      pattern     = "random"
+    })
+  }
+
+  function {
+    id                 = yandex_function.mqtt_emulator.id
+    service_account_id = yandex_iam_service_account.function_sa.id
+  }
+}
+
+# ============================================
+# ПОЛУЧЕНИЕ АКТУАЛЬНОГО ОБРАЗА UBUNTU
+# ============================================
+
+data "yandex_compute_image" "ubuntu_image" {
+  family = "ubuntu-2204-lts"
+}
+
+# ============================================
+# ВИРТУАЛЬНАЯ МАШИНА ДЛЯ MOSQUITTO (MQTT)
+# ============================================
+
+resource "yandex_compute_instance" "mqtt_broker" {
+  name        = "mosquitto-broker"
+  platform_id = "standard-v2"
+  zone        = var.zone
+
+  resources {
+    cores  = 2
+    memory = 2
+  }
+
+  boot_disk {
+    initialize_params {
+      image_id = data.yandex_compute_image.ubuntu_image.id
+      size     = 20
+      type     = "network-ssd"
+    }
+  }
+
+  network_interface {
+    subnet_id = yandex_vpc_subnet.vm_subnet_a.id
+    nat       = true
+    security_group_ids = [yandex_vpc_security_group.mqtt_sg.id]
+  }
+
+  metadata = {
+    ssh-keys = "ubuntu:ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAbrycFWUGU/mp7/DNLHH/EIfhd8g66DZ+i7E0Q5y209 your_email@example.com"
+    user-data = <<-EOF
+      #cloud-config
+      
+      packages:
+        - mosquitto
+        - mosquitto-clients
+        - curl
+        - jq
+      
+      write_files:
+        - path: /opt/mosquitto-forwarder/forward.sh
+          permissions: '0755'
+          content: |
+            #!/bin/bash
+            
+            API_GATEWAY_URL="https://${yandex_api_gateway.api_gw.domain}/data"
+            MQTT_HOST="localhost"
+            MQTT_PORT=1883
+            LOG_FILE="/var/log/mosquitto-forwarder.log"
+            
+            # Подписываемся на все топики и построчно обрабатываем
+            mosquitto_sub -h "$MQTT_HOST" -p "$MQTT_PORT" -t "#" -v | while read -r topic payload; do
+                # Пропускаем системные топики
+                [[ "$topic" == \$SYS/* ]] && continue
+                
+                # Формируем JSON для отправки в API Gateway
+                DATA=$(echo "$payload" | jq -c --arg topic "$topic" '{
+                    timestamp: (.timestamp // (now | strftime("%Y-%m-%dT%H:%M:%SZ"))),
+                    value: (.value // (. | tonumber? // .)),
+                    device_id: (.device_id // $topic)
+                }' 2>/dev/null || echo "$payload" | jq -c --arg topic "$topic" '{
+                    timestamp: (now | strftime("%Y-%m-%dT%H:%M:%SZ")),
+                    value: (. | tonumber? // .),
+                    device_id: $topic
+                }')
+                
+                # Отправляем в API Gateway
+                RESPONSE=$(curl -s -X POST \
+                    -H "Content-Type: application/json" \
+                    -d "$DATA" \
+                    -w "\n%%{http_code}" \
+                    "$API_GATEWAY_URL/")
+                
+                HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+                BODY=$(echo "$RESPONSE" | head -n-1)
+                
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Topic: $topic - HTTP $HTTP_CODE - $BODY" >> "$LOG_FILE"
+            done
+
+        - path: /etc/systemd/system/mqtt-forwarder.service
+          permissions: '0644'
+          content: |
+            [Unit]
+            Description=MQTT to API Gateway Forwarder
+            After=mosquitto.service
+            Requires=mosquitto.service
+            
+            [Service]
+            Type=simple
+            ExecStart=/opt/mosquitto-forwarder/forward.sh
+            Restart=always
+            RestartSec=5
+            
+            [Install]
+            WantedBy=multi-user.target
+
+        - path: /etc/mosquitto/conf.d/default.conf
+          content: |
+            listener 1883 0.0.0.0
+            allow_anonymous true
+            
+            listener 9001
+            protocol websockets
+            
+            log_type all
+            log_timestamp true
+          permissions: '0644'
+
+      runcmd:
+        # Создаем директории и файлы
+        - mkdir -p /opt/mosquitto-forwarder
+        - touch /var/log/mosquitto-forwarder.log
+        - chmod 644 /var/log/mosquitto-forwarder.log
+        
+        # Перезапускаем Mosquitto
+        - systemctl restart mosquitto
+        - sleep 3
+        
+        # Включаем и запускаем форвардер
+        - systemctl daemon-reload
+        - systemctl enable mqtt-forwarder
+        - systemctl start mqtt-forwarder
+        
+        - echo "Mosquitto MQTT Broker + Forwarder setup complete!"
+    EOF
+  }
+
+  service_account_id = yandex_iam_service_account.vm_sa.id
+
+  depends_on = [
+    yandex_api_gateway.api_gw
+  ]
+}
+
 # ============================================
 # ВЫХОДНЫЕ ДАННЫЕ
 # ============================================
@@ -229,4 +477,12 @@ output "api_gateway_domain" {
 
 output "bucket_name" {
   value = yandex_storage_bucket.data_bucket.bucket
+}
+
+output "mqtt_connection_info" {
+  value = {
+    host     = yandex_compute_instance.mqtt_broker.network_interface[0].nat_ip_address
+    port     = 1883
+    ws_port  = 9001
+  }
 }
