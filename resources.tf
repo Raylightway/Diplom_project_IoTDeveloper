@@ -560,9 +560,61 @@ resource "yandex_compute_instance" "grafana_vm" {
       packages:
         - wget
         - curl
+        - jq
+
+      write_files:
+        - path: /opt/grafana-setup.sh
+          permissions: '0755'
+          content: |
+            #!/bin/bash
+            set -e
+            
+            echo "=== Grafana Post-Install Setup ==="
+            
+            # Wait for Grafana to be ready
+            echo "Waiting for Grafana to be ready..."
+            ATTEMPT=0
+            MAX_ATTEMPTS=30
+            while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+              HTTP_STATUS=$(curl -s -o /dev/null -w '%%{http_code}' http://localhost:3000/api/health)
+              if [ "$HTTP_STATUS" = "200" ]; then
+                echo "Grafana is ready!"
+                break
+              fi
+              ATTEMPT=$((ATTEMPT + 1))
+              echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: HTTP $HTTP_STATUS, waiting 10 seconds..."
+              sleep 10
+            done
+            
+            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+              echo "ERROR: Grafana did not start within timeout"
+              exit 1
+            fi
+            
+            # Change admin password
+            echo "Changing default admin password..."
+            curl -s -X PUT \
+              -H 'Content-Type: application/json' \
+              -d '{"oldPassword":"admin","newPassword":"${var.grafana_admin_password}"}' \
+              http://admin:admin@localhost:3000/api/user/password
+            
+            sleep 3
+            
+            # Add PostgreSQL datasource
+            echo "Adding PostgreSQL datasource..."
+            curl -s -X POST \
+              -H 'Content-Type: application/json' \
+              -d '{"name":"PostgreSQL IoT","type":"postgres","url":"${yandex_mdb_postgresql_cluster.db_cluster.host[0].fqdn}:${var.db_port}","database":"${var.database_name}","user":"${var.db_user_name}","secureJsonData":{"password":"${var.db_user_password}"},"access":"proxy","jsonData":{"sslmode":"require","postgresVersion":1500,"timescaledb":false}}' \
+              http://admin:${var.grafana_admin_password}@localhost:3000/api/datasources
+            
+            # List current datasources
+            echo "Current datasources:"
+            curl -s http://admin:${var.grafana_admin_password}@localhost:3000/api/datasources | jq -r '.[].name' || echo "Could not list datasources"
+            
+            echo "=== Setup completed ==="
 
       runcmd:
-        # Ставлю Grafana через прямую ссылку (репозиторий заблокирован для IP Яндекса)
+        # Install Grafana
         - wget -q https://dl.grafana.com/oss/release/grafana_10.4.2_amd64.deb -O /tmp/grafana.deb
         - dpkg -i /tmp/grafana.deb
         - apt-get install -f -y
@@ -570,7 +622,12 @@ resource "yandex_compute_instance" "grafana_vm" {
         - systemctl daemon-reload
         - systemctl enable grafana-server
         - systemctl start grafana-server
-        - "echo Grafana installed and running"
+        - echo "Grafana installed and running"
+        # Wait for Grafana to fully start
+        - sleep 20
+        # Run setup script
+        - /opt/grafana-setup.sh
+        - echo "Grafana setup script completed"
     EOF
   }
 
@@ -578,6 +635,35 @@ resource "yandex_compute_instance" "grafana_vm" {
     yandex_vpc_subnet.vm_subnet_a,
     yandex_mdb_postgresql_cluster.db_cluster
   ]
-  # Жду базу, чтобы потом сразу из веб-интерфейса добавить источник данных
 }
 
+# ============================================
+# ВЫХОДНЫЕ ДАННЫЕ GRAFANA
+# ============================================
+
+output "grafana_url" {
+  value = "http://${yandex_compute_instance.grafana_vm.network_interface[0].nat_ip_address}:3000"
+}
+
+output "grafana_login" {
+  value = "admin"
+}
+
+output "grafana_password" {
+  value     = var.grafana_admin_password
+  sensitive = true
+}
+
+output "grafana_datasource_info" {
+  value = {
+    url        = "http://${yandex_compute_instance.grafana_vm.network_interface[0].nat_ip_address}:3000"
+    login      = "admin"
+    datasource = "PostgreSQL IoT"
+    database   = var.database_name
+    host       = yandex_mdb_postgresql_cluster.db_cluster.host[0].fqdn
+  }
+}
+
+output "grafana_note" {
+  value = "Источник данных PostgreSQL 'PostgreSQL IoT' настраивается автоматически при создании VM. Можете сразу создавать дашборды!"
+}

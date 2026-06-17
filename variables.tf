@@ -113,15 +113,8 @@ variable "mqtt_password" {
 # ПЕРЕМЕННЫЕ GRAFANA
 # ============================================
 
-variable "grafana_username" {
-  description = "Admin username for Grafana"
-  type        = string
-  default     = ""
-  sensitive   = true
-}
-
-variable "grafana_password" {
-  description = "Admin password for Grafana"
+variable "grafana_admin_password" {
+  description = "New admin password for Grafana"
   type        = string
   default     = ""
   sensitive   = true
