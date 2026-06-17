@@ -108,3 +108,21 @@ variable "mqtt_password" {
   default     = ""
   sensitive   = true
 }
+
+# ============================================
+# ПЕРЕМЕННЫЕ GRAFANA
+# ============================================
+
+variable "grafana_username" {
+  description = "Admin username for Grafana"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "grafana_password" {
+  description = "Admin password for Grafana"
+  type        = string
+  default     = ""
+  sensitive   = true
+}

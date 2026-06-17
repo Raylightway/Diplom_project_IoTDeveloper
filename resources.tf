@@ -1,3 +1,5 @@
+# resource.tf
+
 # ============================================
 # СЕТЕВЫЕ РЕСУРСЫ
 # ============================================
@@ -41,7 +43,7 @@ resource "yandex_mdb_postgresql_cluster" "db_cluster" {
       database_name = var.database_name
     }
   }
-
+  
   host {
     zone       = var.zone
     subnet_id  = yandex_vpc_subnet.db_subnet_a.id
@@ -486,3 +488,96 @@ output "mqtt_connection_info" {
     ws_port  = 9001
   }
 }
+# ============================================
+# GRAFANA НА ВИРТУАЛЬНОЙ МАШИНЕ
+# (Managed Service пока не завезли в провайдер, качаю сам)
+# ============================================
+
+# Группа безопасности для Grafana
+resource "yandex_vpc_security_group" "grafana_sg" {
+  name       = "grafana-security-group"
+  network_id = yandex_vpc_network.iot_network.id
+
+  ingress {
+    description    = "Allow Grafana Web Interface"
+    protocol       = "TCP"
+    port           = 3000
+    v4_cidr_blocks = ["0.0.0.0/0"] # ЗАМЕНИ НА СВОЙ IP потом!
+  }
+
+  # Порт 8080 для плагинов или прокси, если вдруг понадобится
+  ingress {
+    description    = "Grafana alternative port"
+    protocol       = "TCP"
+    port           = 8080
+    v4_cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description    = "SSH"
+    protocol       = "TCP"
+    port           = 22
+    v4_cidr_blocks = ["0.0.0.0/0"] # Тоже лучше ограничить до своего IP
+  }
+
+  egress {
+    description    = "Allow all outbound traffic"
+    protocol       = "ANY"
+    v4_cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# Сама виртуалка с Grafana
+resource "yandex_compute_instance" "grafana_vm" {
+  name        = "grafana-instance"
+  platform_id = "standard-v2"
+  zone        = var.zone
+
+  resources {
+    cores  = 2
+    memory = 2 # 2 ГБ для Grafana — комфортный минимум
+  }
+
+  boot_disk {
+    initialize_params {
+      image_id = data.yandex_compute_image.ubuntu_image.id
+      size     = 20
+      type     = "network-ssd"
+    }
+  }
+
+  network_interface {
+    subnet_id          = yandex_vpc_subnet.vm_subnet_a.id
+    nat                = true
+    security_group_ids = [yandex_vpc_security_group.grafana_sg.id]
+  }
+
+  metadata = {
+    ssh-keys = "ubuntu:ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAbrycFWUGU/mp7/DNLHH/EIfhd8g66DZ+i7E0Q5y209 your_email@example.com"
+    user-data = <<-EOF
+      #cloud-config
+      
+      packages:
+        - wget
+        - curl
+
+      runcmd:
+        # Ставлю Grafana через прямую ссылку (репозиторий заблокирован для IP Яндекса)
+        - wget -q https://dl.grafana.com/oss/release/grafana_10.4.2_amd64.deb -O /tmp/grafana.deb
+        - dpkg -i /tmp/grafana.deb
+        - apt-get install -f -y
+        - rm /tmp/grafana.deb
+        - systemctl daemon-reload
+        - systemctl enable grafana-server
+        - systemctl start grafana-server
+        - "echo Grafana installed and running"
+    EOF
+  }
+
+  depends_on = [
+    yandex_vpc_subnet.vm_subnet_a,
+    yandex_mdb_postgresql_cluster.db_cluster
+  ]
+  # Жду базу, чтобы потом сразу из веб-интерфейса добавить источник данных
+}
+
