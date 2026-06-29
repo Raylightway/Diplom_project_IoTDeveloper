@@ -1,7 +1,6 @@
 import json
 import boto3
 import psycopg2
-import psycopg2.extras
 import os
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
@@ -10,225 +9,19 @@ def handler(event, context):
     """
     Основная функция обработки
     - API Gateway: сохраняет данные в S3 и raw_telemetry
-    - Timer trigger: агрегирует данные из S3 и сохраняет в averaged_data
-    - API endpoints: /api/data и /api/aggregated для дашборда
+    - Timer trigger: агрегирует данные из S3 и сохраняет в averaged_metrics
     """
-    
+
     # Определяем тип вызова
     if 'httpMethod' in event:
-        # Проверяем путь для API данных дашборда
-        path = event.get('path', '')
-        if path == '/api/data':
-            return get_dashboard_data(event, context)
-        elif path == '/api/aggregated':
-            return get_aggregated_data(event, context)
-        else:
-            # Вызов через API Gateway для сохранения данных
-            return process_api_request(event, context)
+        # Вызов через API Gateway для сохранения данных
+        return process_api_request(event, context)
     else:
         # Вызов через триггер (агрегация)
         return process_aggregation(event, context)
 
-def get_dashboard_data(event, context):
-    """
-    Возвращает данные для дашборда
-    Endpoint: GET /api/data
-    """
-    print("Getting dashboard data...")
-    
-    # Получаем параметры запроса
-    params = event.get('queryStringParameters', {}) or {}
-    hours = int(params.get('hours', 6))
-    device_filter = params.get('device', 'all')
-    
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        
-        # 1. Получаем общую статистику
-        if device_filter == 'all':
-            cursor.execute("""
-                SELECT 
-                    COUNT(*) as total,
-                    COALESCE(AVG(value), 0) as average,
-                    COUNT(DISTINCT device_id) as devices
-                FROM raw_telemetry
-                WHERE timestamp > NOW() - INTERVAL '%s hours'
-            """, (hours,))
-        else:
-            cursor.execute("""
-                SELECT 
-                    COUNT(*) as total,
-                    COALESCE(AVG(value), 0) as average,
-                    COUNT(DISTINCT device_id) as devices
-                FROM raw_telemetry
-                WHERE timestamp > NOW() - INTERVAL '%s hours'
-                AND device_id = %s
-            """, (hours, device_filter))
-        
-        stats = cursor.fetchone()
-        
-        # 2. Получаем временной ряд для графика
-        if device_filter == 'all':
-            cursor.execute("""
-                SELECT 
-                    timestamp, 
-                    value, 
-                    device_id
-                FROM raw_telemetry
-                WHERE timestamp > NOW() - INTERVAL '%s hours'
-                ORDER BY timestamp ASC
-                LIMIT 1000
-            """, (hours,))
-        else:
-            cursor.execute("""
-                SELECT 
-                    timestamp, 
-                    value, 
-                    device_id
-                FROM raw_telemetry
-                WHERE timestamp > NOW() - INTERVAL '%s hours'
-                AND device_id = %s
-                ORDER BY timestamp ASC
-                LIMIT 1000
-            """, (hours, device_filter))
-        
-        timeline = cursor.fetchall()
-        
-        # 3. Получаем значения для гистограммы
-        cursor.execute("""
-            SELECT value
-            FROM raw_telemetry
-            WHERE timestamp > NOW() - INTERVAL '24 hours'
-            LIMIT 2000
-        """)
-        values = [row['value'] for row in cursor.fetchall()]
-        
-        # 4. Получаем статистику по устройствам
-        cursor.execute("""
-            SELECT 
-                device_id,
-                COUNT(*) as count,
-                AVG(value) as avg_value,
-                MIN(value) as min_value,
-                MAX(value) as max_value
-            FROM raw_telemetry
-            WHERE timestamp > NOW() - INTERVAL '24 hours'
-            GROUP BY device_id
-            ORDER BY device_id
-        """)
-        device_stats = cursor.fetchall()
-        
-        # 5. Получаем список всех устройств
-        cursor.execute("SELECT DISTINCT device_id FROM raw_telemetry ORDER BY device_id")
-        devices = [row['device_id'] for row in cursor.fetchall()]
-        
-        cursor.close()
-        
-        return {
-            'statusCode': 200,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type'
-            },
-            'body': json.dumps({
-                'stats': {
-                    'total': stats['total'] if stats else 0,
-                    'average': float(stats['average']) if stats else 0,
-                    'devices': stats['devices'] if stats else 0
-                },
-                'timeline': [{'timestamp': row['timestamp'].isoformat(), 'value': row['value'], 'device_id': row['device_id']} for row in timeline],
-                'values': values,
-                'device_stats': {row['device_id']: {'count': row['count'], 'avg': float(row['avg_value']), 'min': float(row['min_value']), 'max': float(row['max_value'])} for row in device_stats},
-                'devices': devices
-            }, default=str)
-        }
-        
-    except Exception as e:
-        print(f"Error getting dashboard data: {e}")
-        return {
-            'statusCode': 500,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            },
-            'body': json.dumps({'error': str(e)})
-        }
-    finally:
-        if conn:
-            conn.close()
-
-def get_aggregated_data(event, context):
-    """
-    Возвращает агрегированные данные для дашборда
-    Endpoint: GET /api/aggregated
-    """
-    print("Getting aggregated data...")
-    
-    # Получаем параметры запроса
-    params = event.get('queryStringParameters', {}) or {}
-    hours = int(params.get('hours', 24))
-    
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        
-        cursor.execute("""
-            SELECT 
-                interval_start,
-                average_value,
-                min_value,
-                max_value,
-                count,
-                devices_count
-            FROM averaged_data
-            WHERE interval_start > NOW() - INTERVAL '%s hours'
-            ORDER BY interval_start ASC
-        """, (hours,))
-        
-        intervals = cursor.fetchall()
-        cursor.close()
-        
-        return {
-            'statusCode': 200,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type'
-            },
-            'body': json.dumps({
-                'intervals': [{
-                    'interval_start': row['interval_start'].isoformat(),
-                    'average_value': float(row['average_value']),
-                    'min_value': float(row['min_value']) if row['min_value'] else None,
-                    'max_value': float(row['max_value']) if row['max_value'] else None,
-                    'count': row['count'],
-                    'devices_count': row['devices_count']
-                } for row in intervals]
-            }, default=str)
-        }
-        
-    except Exception as e:
-        print(f"Error getting aggregated data: {e}")
-        return {
-            'statusCode': 500,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            },
-            'body': json.dumps({'error': str(e)})
-        }
-    finally:
-        if conn:
-            conn.close()
-
 # ============================================
-# ОСТАЛЬНЫЕ ФУНКЦИИ (БЕЗ ИЗМЕНЕНИЙ)
+# ОСТАЛЬНЫЕ ФУНКЦИИ
 # ============================================
 
 def process_api_request(event, context):
@@ -246,22 +39,36 @@ def process_api_request(event, context):
             'body': json.dumps({'error': 'Invalid JSON in request body'})
         }
 
-    timestamp = body.get('timestamp', datetime.now(timezone.utc).isoformat())
-    value = body.get('value')
+    # Извлекаем поля из нового формата
     device_id = body.get('device_id', 'unknown')
-
-    if value is None:
+    firmware_version = body.get('firmware_version', 'unknown')
+    status = body.get('status', 'unknown')
+    timestamp = body.get('timestamp', datetime.now(timezone.utc).isoformat())
+    metrics = body.get('metrics', {})
+    
+    # Проверяем наличие метрик
+    if not metrics:
         return {
             'statusCode': 400,
-            'body': json.dumps({'error': 'Value is required'})
+            'body': json.dumps({'error': 'Metrics are required'})
+        }
+    
+    temperature = metrics.get('temperature_c')
+    humidity = metrics.get('humidity_percent')
+    battery = metrics.get('battery_level_percent')
+    
+    if temperature is None and humidity is None and battery is None:
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'error': 'At least one metric is required'})
         }
 
     errors = []
     
     # 1. Сохраняем в S3 bucket
     try:
-        save_to_bucket(timestamp, value, device_id)
-        print(f"Saved to S3: device={device_id}, value={value}, time={timestamp}")
+        save_to_bucket(body)
+        print(f"Saved to S3: device={device_id}, metrics={metrics}, time={timestamp}")
     except Exception as e:
         error_msg = f"Failed to save to S3: {str(e)}"
         print(error_msg)
@@ -269,8 +76,8 @@ def process_api_request(event, context):
 
     # 2. Сохраняем в таблицу raw_telemetry
     try:
-        save_raw_to_database(timestamp, value, device_id)
-        print(f"Saved to raw_telemetry: device={device_id}, value={value}, time={timestamp}")
+        save_raw_to_database(device_id, firmware_version, status, timestamp, metrics)
+        print(f"Saved to raw_telemetry: device={device_id}, time={timestamp}")
     except Exception as e:
         error_msg = f"Failed to save to database: {str(e)}"
         print(error_msg)
@@ -284,11 +91,7 @@ def process_api_request(event, context):
                 'status': 'partial_success',
                 'message': 'Data saved with errors',
                 'errors': errors,
-                'data': {
-                    'timestamp': timestamp,
-                    'value': value,
-                    'device_id': device_id
-                }
+                'data': body
             })
         }
     else:
@@ -301,19 +104,15 @@ def process_api_request(event, context):
             'body': json.dumps({
                 'status': 'success',
                 'message': 'Data saved to S3 and database',
-                'data': {
-                    'timestamp': timestamp,
-                    'value': value,
-                    'device_id': device_id
-                }
+                'data': body
             })
         }
 
 def process_aggregation(event, context):
     """
     Агрегация данных (запускается по триггеру каждые 5 минут)
-    Читает данные из S3 bucket, усредняет, сохраняет в averaged_data,
-    затем удаляет обработанные файлы из S3
+    Читает данные из S3 bucket, усредняет по device_id и метрикам,
+    сохраняет в averaged_metrics, затем удаляет обработанные файлы из S3
     """
     print("=" * 50)
     print(f"Starting aggregation at {datetime.now(timezone.utc).isoformat()}")
@@ -354,11 +153,11 @@ def process_aggregation(event, context):
     
     print(f"Loaded {len(raw_data)} records from S3")
     
-    # Агрегируем данные по 5-минутным интервалам
-    aggregated_data = aggregate_data(raw_data)
-    print(f"Aggregated into {len(aggregated_data)} intervals")
+    # Агрегируем данные по device_id и 5-минутным интервалам
+    aggregated_data = aggregate_data_by_device(raw_data)
+    print(f"Aggregated into {len(aggregated_data)} records")
     
-    # Сохраняем агрегированные данные в averaged_data
+    # Сохраняем агрегированные данные в averaged_metrics
     try:
         save_aggregated_to_database(aggregated_data)
         print(f"Successfully saved {len(aggregated_data)} aggregated records to database")
@@ -390,7 +189,7 @@ def process_aggregation(event, context):
             'message': 'Aggregation completed',
             'files_processed': len(s3_files),
             'records_processed': len(raw_data),
-            'intervals_created': len(aggregated_data),
+            'aggregated_records': len(aggregated_data),
             'files_deleted': deleted_count
         })
     }
@@ -399,21 +198,20 @@ def process_aggregation(event, context):
 # ФУНКЦИИ ДЛЯ РАБОТЫ С S3 BUCKET
 # ============================================
 
-def save_to_bucket(timestamp, value, device_id):
+def save_to_bucket(data):
     """Сохраняет данные в S3 bucket"""
     s3 = get_s3_client()
     bucket_name = os.environ['BUCKET_NAME']
     
     # Создаем уникальный ключ файла
+    device_id = data.get('device_id', 'unknown')
+    timestamp = data.get('timestamp', datetime.now(timezone.utc).isoformat())
     dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+    
     file_key = f"raw/{dt.year}/{dt.month:02d}/{dt.day:02d}/{dt.hour:02d}/{dt.minute:02d}_{dt.second:02d}_{device_id}_{int(dt.timestamp() * 1000)}.json"
 
-    data = {
-        'timestamp': timestamp,
-        'value': value,
-        'device_id': device_id,
-        'received_at': datetime.now(timezone.utc).isoformat()
-    }
+    # Добавляем время получения
+    data['received_at'] = datetime.now(timezone.utc).isoformat()
 
     s3.put_object(
         Bucket=bucket_name,
@@ -493,15 +291,26 @@ def get_s3_client():
 # ФУНКЦИИ ДЛЯ РАБОТЫ С БАЗОЙ ДАННЫХ
 # ============================================
 
-def save_raw_to_database(timestamp, value, device_id):
+def save_raw_to_database(device_id, firmware_version, status, timestamp, metrics):
     """Сохраняет сырые данные в таблицу raw_telemetry"""
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO raw_telemetry (timestamp, value, device_id, created_at) 
-            VALUES (%s, %s, %s, %s)
-        """, (timestamp, value, device_id, datetime.now(timezone.utc)))
+            INSERT INTO raw_telemetry 
+            (device_id, firmware_version, status, timestamp, 
+             temperature_c, humidity_percent, battery_level_percent, created_at) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            device_id, 
+            firmware_version, 
+            status, 
+            timestamp,
+            metrics.get('temperature_c'),
+            metrics.get('humidity_percent'),
+            metrics.get('battery_level_percent'),
+            datetime.now(timezone.utc)
+        ))
         conn.commit()
         cursor.close()
     except Exception as e:
@@ -519,13 +328,17 @@ def init_database():
     try:
         cursor = conn.cursor()
         
-        # Создаем таблицу raw_telemetry
+        # Создаем таблицу raw_telemetry с новыми полями
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS raw_telemetry (
                 id SERIAL PRIMARY KEY,
+                device_id VARCHAR(100) NOT NULL,
+                firmware_version VARCHAR(50),
+                status VARCHAR(50),
                 timestamp TIMESTAMP NOT NULL,
-                value DOUBLE PRECISION NOT NULL,
-                device_id VARCHAR(100),
+                temperature_c DOUBLE PRECISION,
+                humidity_percent DOUBLE PRECISION,
+                battery_level_percent DOUBLE PRECISION,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -534,25 +347,36 @@ def init_database():
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_raw_timestamp ON raw_telemetry(timestamp);
             CREATE INDEX IF NOT EXISTS idx_raw_device_id ON raw_telemetry(device_id);
+            CREATE INDEX IF NOT EXISTS idx_raw_device_timestamp ON raw_telemetry(device_id, timestamp);
         """)
         
-        # Создаем таблицу averaged_data
+        # Создаем таблицу averaged_metrics для усредненных данных
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS averaged_data (
+            CREATE TABLE IF NOT EXISTS averaged_metrics (
                 id SERIAL PRIMARY KEY,
-                interval_start TIMESTAMP NOT NULL UNIQUE,
-                average_value DOUBLE PRECISION NOT NULL,
-                min_value DOUBLE PRECISION,
-                max_value DOUBLE PRECISION,
-                count INTEGER NOT NULL,
-                devices_count INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                device_id VARCHAR(100) NOT NULL,
+                interval_start TIMESTAMP NOT NULL,
+                interval_end TIMESTAMP NOT NULL,
+                avg_temperature_c DOUBLE PRECISION,
+                min_temperature_c DOUBLE PRECISION,
+                max_temperature_c DOUBLE PRECISION,
+                avg_humidity_percent DOUBLE PRECISION,
+                min_humidity_percent DOUBLE PRECISION,
+                max_humidity_percent DOUBLE PRECISION,
+                avg_battery_level_percent DOUBLE PRECISION,
+                min_battery_level_percent DOUBLE PRECISION,
+                max_battery_level_percent DOUBLE PRECISION,
+                sample_count INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(device_id, interval_start)
             )
         """)
         
-        # Создаем индексы для averaged_data
+        # Создаем индексы для averaged_metrics
         cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_avg_interval_start ON averaged_data(interval_start);
+            CREATE INDEX IF NOT EXISTS idx_avg_device_id ON averaged_metrics(device_id);
+            CREATE INDEX IF NOT EXISTS idx_avg_interval_start ON averaged_metrics(interval_start);
+            CREATE INDEX IF NOT EXISTS idx_avg_device_interval ON averaged_metrics(device_id, interval_start);
         """)
         
         conn.commit()
@@ -568,41 +392,83 @@ def init_database():
         if conn:
             conn.close()
 
-def aggregate_data(data_list):
-    """Агрегирует данные по 5-минутным интервалам"""
-    grouped = defaultdict(lambda: {'values': [], 'devices': set()})
+def aggregate_data_by_device(data_list):
+    """
+    Агрегирует данные по device_id и 5-минутным интервалам
+    Для каждого устройства и интервала вычисляет средние значения метрик
+    """
+    # Структура: {device_id: {interval_start: {metrics}}}
+    grouped = defaultdict(lambda: defaultdict(lambda: {
+        'temperatures': [],
+        'humidities': [],
+        'batteries': [],
+        'statuses': []
+    }))
     
     for item in data_list:
+        device_id = item.get('device_id', 'unknown')
         timestamp = datetime.fromisoformat(item['timestamp'].replace('Z', '+00:00'))
+        
         # Округляем до 5 минут
         interval_start = timestamp.replace(
             minute=(timestamp.minute // 5) * 5,
             second=0,
             microsecond=0
         )
+        interval_end = interval_start + timedelta(minutes=5)
         
-        key = interval_start.isoformat()
-        grouped[key]['values'].append(item['value'])
-        grouped[key]['devices'].add(item.get('device_id', 'unknown'))
+        metrics = item.get('metrics', {})
+        
+        # Собираем метрики если они есть
+        if 'temperature_c' in metrics and metrics['temperature_c'] is not None:
+            grouped[device_id][interval_start]['temperatures'].append(metrics['temperature_c'])
+        
+        if 'humidity_percent' in metrics and metrics['humidity_percent'] is not None:
+            grouped[device_id][interval_start]['humidities'].append(metrics['humidity_percent'])
+        
+        if 'battery_level_percent' in metrics and metrics['battery_level_percent'] is not None:
+            grouped[device_id][interval_start]['batteries'].append(metrics['battery_level_percent'])
+        
+        grouped[device_id][interval_start]['statuses'].append(item.get('status', 'unknown'))
     
     # Вычисляем агрегированные значения
     aggregated = []
-    for interval_start, data in grouped.items():
-        values = data['values']
-        avg_value = sum(values) / len(values)
-        aggregated.append({
-            'interval_start': interval_start,
-            'average_value': round(avg_value, 2),
-            'min_value': round(min(values), 2),
-            'max_value': round(max(values), 2),
-            'count': len(values),
-            'devices_count': len(data['devices'])
-        })
+    
+    for device_id, intervals in grouped.items():
+        for interval_start, data in intervals.items():
+            interval_end = interval_start + timedelta(minutes=5)
+            
+            record = {
+                'device_id': device_id,
+                'interval_start': interval_start.isoformat(),
+                'interval_end': interval_end.isoformat(),
+                'sample_count': len(data['statuses'])
+            }
+            
+            # Агрегируем температуру
+            if data['temperatures']:
+                record['avg_temperature_c'] = round(sum(data['temperatures']) / len(data['temperatures']), 2)
+                record['min_temperature_c'] = round(min(data['temperatures']), 2)
+                record['max_temperature_c'] = round(max(data['temperatures']), 2)
+            
+            # Агрегируем влажность
+            if data['humidities']:
+                record['avg_humidity_percent'] = round(sum(data['humidities']) / len(data['humidities']), 2)
+                record['min_humidity_percent'] = round(min(data['humidities']), 2)
+                record['max_humidity_percent'] = round(max(data['humidities']), 2)
+            
+            # Агрегируем заряд батареи
+            if data['batteries']:
+                record['avg_battery_level_percent'] = round(sum(data['batteries']) / len(data['batteries']), 2)
+                record['min_battery_level_percent'] = round(min(data['batteries']), 2)
+                record['max_battery_level_percent'] = round(max(data['batteries']), 2)
+            
+            aggregated.append(record)
     
     return aggregated
 
 def save_aggregated_to_database(aggregated_data):
-    """Сохраняет агрегированные данные в таблицу averaged_data"""
+    """Сохраняет агрегированные данные в таблицу averaged_metrics"""
     conn = get_db_connection()
     cursor = None
     
@@ -611,23 +477,40 @@ def save_aggregated_to_database(aggregated_data):
         
         for data in aggregated_data:
             cursor.execute("""
-                INSERT INTO averaged_data 
-                (interval_start, average_value, min_value, max_value, count, devices_count)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (interval_start) DO UPDATE SET
-                    average_value = EXCLUDED.average_value,
-                    min_value = EXCLUDED.min_value,
-                    max_value = EXCLUDED.max_value,
-                    count = EXCLUDED.count,
-                    devices_count = EXCLUDED.devices_count,
+                INSERT INTO averaged_metrics 
+                (device_id, interval_start, interval_end,
+                 avg_temperature_c, min_temperature_c, max_temperature_c,
+                 avg_humidity_percent, min_humidity_percent, max_humidity_percent,
+                 avg_battery_level_percent, min_battery_level_percent, max_battery_level_percent,
+                 sample_count)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (device_id, interval_start) DO UPDATE SET
+                    interval_end = EXCLUDED.interval_end,
+                    avg_temperature_c = EXCLUDED.avg_temperature_c,
+                    min_temperature_c = EXCLUDED.min_temperature_c,
+                    max_temperature_c = EXCLUDED.max_temperature_c,
+                    avg_humidity_percent = EXCLUDED.avg_humidity_percent,
+                    min_humidity_percent = EXCLUDED.min_humidity_percent,
+                    max_humidity_percent = EXCLUDED.max_humidity_percent,
+                    avg_battery_level_percent = EXCLUDED.avg_battery_level_percent,
+                    min_battery_level_percent = EXCLUDED.min_battery_level_percent,
+                    max_battery_level_percent = EXCLUDED.max_battery_level_percent,
+                    sample_count = EXCLUDED.sample_count,
                     created_at = CURRENT_TIMESTAMP
             """, (
+                data['device_id'],
                 data['interval_start'],
-                data['average_value'],
-                data['min_value'],
-                data['max_value'],
-                data['count'],
-                data['devices_count']
+                data['interval_end'],
+                data.get('avg_temperature_c'),
+                data.get('min_temperature_c'),
+                data.get('max_temperature_c'),
+                data.get('avg_humidity_percent'),
+                data.get('min_humidity_percent'),
+                data.get('max_humidity_percent'),
+                data.get('avg_battery_level_percent'),
+                data.get('min_battery_level_percent'),
+                data.get('max_battery_level_percent'),
+                data['sample_count']
             ))
         
         conn.commit()

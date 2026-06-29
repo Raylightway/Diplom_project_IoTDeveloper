@@ -13,11 +13,13 @@ def handler(event, context):
     Параметры event:
     - mqtt_host: адрес MQTT брокера
     - mqtt_port: порт (по умолчанию 1883)
-    - devices: список устройств
+    - devices: список устройств с firmware_version
     - topics: список топиков (если не указаны, используются device_id)
     - count: количество сообщений на устройство
     - interval: интервал между сообщениями (сек)
-    - value_range: [min, max] диапазон значений
+    - temperature_range: [min, max] диапазон температуры
+    - humidity_range: [min, max] диапазон влажности
+    - battery_range: [min, max] диапазон заряда батареи
     - pattern: паттерн генерации (random, sine, linear, step, sawtooth)
     """
     
@@ -38,17 +40,31 @@ def handler(event, context):
             })
         }
     
-    # Параметры устройств
-    devices = event.get('devices', ['sensor_1', 'sensor_2', 'sensor_3'])
-    topics = event.get('topics', [f"devices/{device}" for device in devices])
+    # Параметры устройств (теперь с firmware_version)
+    devices = event.get('devices', [
+        {'device_id': 'sensor_1', 'firmware_version': '1.0.0'},
+        {'device_id': 'sensor_2', 'firmware_version': '1.0.1'},
+        {'device_id': 'sensor_3', 'firmware_version': '1.0.0'}
+    ])
+    
+    # Если devices - список строк, преобразуем в объекты
+    if devices and isinstance(devices[0], str):
+        devices = [{'device_id': d, 'firmware_version': '1.0.0'} for d in devices]
+    
+    topics = event.get('topics', [f"devices/{device['device_id']}" for device in devices])
     
     if len(topics) != len(devices):
-        topics = [f"devices/{device}" for device in devices]
+        topics = [f"devices/{device['device_id']}" for device in devices]
     
     # Параметры отправки
     count = int(event.get('count', 10))
     interval = float(event.get('interval', 1.0))
-    value_range = event.get('value_range', [0, 100])
+    
+    # Диапазоны для разных метрик
+    temperature_range = event.get('temperature_range', [15.0, 35.0])
+    humidity_range = event.get('humidity_range', [30.0, 90.0])
+    battery_range = event.get('battery_range', [20.0, 100.0])
+    
     pattern = event.get('pattern', 'random')
     
     # Дополнительные параметры
@@ -59,7 +75,10 @@ def handler(event, context):
     
     print(f"Target: {mqtt_host}:{mqtt_port}")
     print(f"Devices: {len(devices)}, Messages per device: {count}")
-    print(f"Pattern: {pattern}, Range: {value_range}")
+    print(f"Pattern: {pattern}")
+    print(f"Temperature range: {temperature_range}")
+    print(f"Humidity range: {humidity_range}")
+    print(f"Battery range: {battery_range}")
     
     # Создаем MQTT клиент
     client_id = f"emulator_{int(time.time())}_{random.randint(1000, 9999)}"
@@ -122,9 +141,13 @@ def handler(event, context):
     results = []
     start_time = time.time()
     
-    for device_id, topic in zip(devices, topics):
+    for device, topic in zip(devices, topics):
+        device_id = device['device_id']
+        firmware_version = device['firmware_version']
+        
         device_result = {
             'device_id': device_id,
+            'firmware_version': firmware_version,
             'topic': topic,
             'messages_sent': 0,
             'messages_failed': 0,
@@ -132,16 +155,22 @@ def handler(event, context):
         }
         
         for i in range(count):
-            # Генерируем значение
-            value = generate_value(pattern, i, count, value_range)
+            # Генерируем метрики
+            status = random.choice(['online', 'online', 'online', 'warning', 'error'])  # 60% online
             
-            # Формируем payload
+            metrics = {
+                'temperature_c': round(generate_value(pattern, i, count, temperature_range), 2),
+                'humidity_percent': round(generate_value(pattern, i, count, humidity_range), 2),
+                'battery_level_percent': round(generate_value('linear_decrease', i, count, battery_range), 2)
+            }
+            
+            # Формируем payload в новом формате
             payload = {
                 'device_id': device_id,
+                'firmware_version': firmware_version,
+                'status': status,
                 'timestamp': datetime.now(timezone.utc).isoformat(),
-                'value': value,
-                'sequence': i + 1,
-                'pattern': pattern
+                'metrics': metrics
             }
             
             try:
@@ -155,8 +184,10 @@ def handler(event, context):
                 
                 if result.rc == mqtt.MQTT_ERR_SUCCESS:
                     device_result['messages_sent'] += 1
-                    device_result['values'].append(value)
-                    print(f"  ✓ {topic}: {value:.2f}")
+                    device_result['values'].append(metrics)
+                    print(f"  ✓ {topic}: temp={metrics['temperature_c']}°C, "
+                          f"hum={metrics['humidity_percent']}%, "
+                          f"bat={metrics['battery_level_percent']}%")
                 else:
                     device_result['messages_failed'] += 1
                     print(f"  ✗ {topic}: publish failed")
@@ -209,6 +240,7 @@ def generate_value(pattern, index, total, value_range):
     - random: случайное значение в диапазоне
     - sine: синусоида
     - linear: линейное возрастание
+    - linear_decrease: линейное убывание (для батареи)
     - step: ступенчатая функция
     - sawtooth: пилообразная волна
     """
@@ -224,6 +256,10 @@ def generate_value(pattern, index, total, value_range):
     elif pattern == 'linear':
         # Линейное возрастание
         value = min_val + (range_size * index / total)
+    
+    elif pattern == 'linear_decrease':
+        # Линейное убывание (для батареи)
+        value = max_val - (range_size * index / total)
         
     elif pattern == 'step':
         # Ступенчатая функция

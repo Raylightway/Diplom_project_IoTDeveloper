@@ -303,7 +303,7 @@ resource "yandex_function_trigger" "mqtt_emulation_trigger" {
   name = "mqtt-emulation-trigger"
 
   timer {
-    cron_expression = "*/1 * * * ? *"  # Каждые 2 минуты
+    cron_expression = "*/1 * * * ? *"  # Каждые 1 минутy
     payload = jsonencode({
       devices     = ["Device_1", "Device_2","Device_3","Device_4"]
       count       = 5
@@ -365,7 +365,7 @@ resource "yandex_compute_instance" "mqtt_broker" {
         - mosquitto-clients
         - curl
         - jq
-      
+
       write_files:
         - path: /opt/mosquitto-forwarder/forward.sh
           permissions: '0755'
@@ -382,16 +382,45 @@ resource "yandex_compute_instance" "mqtt_broker" {
                 # Пропускаем системные топики
                 [[ "$topic" == \$SYS/* ]] && continue
                 
-                # Формируем JSON для отправки в API Gateway
-                DATA=$(echo "$payload" | jq -c --arg topic "$topic" '{
-                    timestamp: (.timestamp // (now | strftime("%Y-%m-%dT%H:%M:%SZ"))),
-                    value: (.value // (. | tonumber? // .)),
-                    device_id: (.device_id // $topic)
-                }' 2>/dev/null || echo "$payload" | jq -c --arg topic "$topic" '{
-                    timestamp: (now | strftime("%Y-%m-%dT%H:%M:%SZ")),
-                    value: (. | tonumber? // .),
-                    device_id: $topic
-                }')
+                # Проверяем, является ли payload валидным JSON
+                if ! echo "$payload" | jq empty 2>/dev/null; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: Invalid JSON from topic $topic" >> "$LOG_FILE"
+                    continue
+                fi
+                
+                # Извлекаем данные из нового формата
+                DEVICE_ID=$(echo "$payload" | jq -r '.device_id')
+                FIRMWARE_VERSION=$(echo "$payload" | jq -r '.firmware_version')
+                STATUS=$(echo "$payload" | jq -r '.status')
+                TIMESTAMP=$(echo "$payload" | jq -r '.timestamp')
+                
+                # Извлекаем метрики
+                TEMPERATURE=$(echo "$payload" | jq -r '.metrics.temperature_c')
+                HUMIDITY=$(echo "$payload" | jq -r '.metrics.humidity_percent')
+                BATTERY=$(echo "$payload" | jq -r '.metrics.battery_level_percent')
+                
+                # Формируем данные для отправки в API Gateway
+                DATA=$(jq -n \
+                    --arg device_id "$DEVICE_ID" \
+                    --arg firmware_version "$FIRMWARE_VERSION" \
+                    --arg status "$STATUS" \
+                    --arg timestamp "$TIMESTAMP" \
+                    --arg topic "$topic" \
+                    --argjson temperature "$TEMPERATURE" \
+                    --argjson humidity "$HUMIDITY" \
+                    --argjson battery "$BATTERY" \
+                    '{
+                        device_id: $device_id,
+                        firmware_version: $firmware_version,
+                        status: $status,
+                        timestamp: $timestamp,
+                        topic: $topic,
+                        metrics: {
+                            temperature_c: $temperature,
+                            humidity_percent: $humidity,
+                            battery_level_percent: $battery
+                        }
+                    }')
                 
                 # Отправляем в API Gateway
                 RESPONSE=$(curl -s -X POST \
@@ -403,7 +432,7 @@ resource "yandex_compute_instance" "mqtt_broker" {
                 HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
                 BODY=$(echo "$RESPONSE" | head -n-1)
                 
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - Topic: $topic - HTTP $HTTP_CODE - $BODY" >> "$LOG_FILE"
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Topic: $topic - Device: $DEVICE_ID - Status: $STATUS - Temp: $${TEMPERATURE}°C - Hum: $${HUMIDITY}% - Bat: $${BATTERY}% - HTTP $HTTP_CODE" >> "$LOG_FILE"
             done
 
         - path: /etc/systemd/system/mqtt-forwarder.service
@@ -602,14 +631,301 @@ resource "yandex_compute_instance" "grafana_vm" {
             
             # Add PostgreSQL datasource
             echo "Adding PostgreSQL datasource..."
-            curl -s -X POST \
+            DATASOURCE_RESPONSE=$(curl -s -X POST \
               -H 'Content-Type: application/json' \
               -d '{"name":"PostgreSQL IoT","type":"postgres","url":"${yandex_mdb_postgresql_cluster.db_cluster.host[0].fqdn}:${var.db_port}","database":"${var.database_name}","user":"${var.db_user_name}","secureJsonData":{"password":"${var.db_user_password}"},"access":"proxy","jsonData":{"sslmode":"require","postgresVersion":1500,"timescaledb":false}}' \
-              http://admin:${var.grafana_admin_password}@localhost:3000/api/datasources
+              http://admin:${var.grafana_admin_password}@localhost:3000/api/datasources)
+            
+            DATASOURCE_UID=$(echo $DATASOURCE_RESPONSE | jq -r '.datasource.uid // .uid')
+            echo "Datasource UID: $DATASOURCE_UID"
             
             # List current datasources
             echo "Current datasources:"
             curl -s http://admin:${var.grafana_admin_password}@localhost:3000/api/datasources | jq -r '.[].name' || echo "Could not list datasources"
+            
+            # Create dashboard
+            echo "Creating dashboard..."
+            
+            DASHBOARD='{
+              "dashboard": {
+                "id": null,
+                "uid": "iot-aggregated-metrics",
+                "title": "IoT Devices - Aggregated Metrics (5min)",
+                "tags": ["iot", "aggregated", "5min"],
+                "timezone": "browser",
+                "schemaVersion": 39,
+                "version": 0,
+                "refresh": "5m",
+                "time": {
+                  "from": "now-6h",
+                  "to": "now"
+                },
+                "panels": [
+                  {
+                    "id": 1,
+                    "type": "stat",
+                    "title": "Active Devices",
+                    "gridPos": {"h": 3, "w": 6, "x": 0, "y": 0},
+                    "targets": [
+                      {
+                        "refId": "A",
+                        "datasource": {"type": "postgres", "uid": "'$DATASOURCE_UID'"},
+                        "rawSql": "SELECT COUNT(DISTINCT device_id) as count FROM averaged_metrics WHERE interval_start >= $__timeFrom()   AND interval_start <= $__timeTo()",
+                        "format": "table"
+                      }
+                    ],
+                    "options": {
+                      "colorMode": "background",
+                      "graphMode": "area",
+                      "justifyMode": "auto",
+                      "orientation": "auto",
+                      "reduceOptions": {
+                        "values": false,
+                        "calcs": ["lastNotNull"]
+                      },
+                      "textMode": "auto"
+                    },
+                    "fieldConfig": {
+                      "defaults": {
+                        "color": {"mode": "thresholds"},
+                        "thresholds": {
+                          "mode": "absolute",
+                          "steps": [
+                            {"color": "red", "value": null},
+                            {"color": "green", "value": 1}
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "id": 2,
+                    "type": "stat",
+                    "title": "Avg Samples per Device",
+                    "gridPos": {"h": 3, "w": 6, "x": 6, "y": 0},
+                    "targets": [
+                      {
+                        "refId": "A",
+                        "datasource": {"type": "postgres", "uid": "'$DATASOURCE_UID'"},
+                        "rawSql": "SELECT ROUND(AVG(sample_count)::numeric, 1) as avg_samples FROM averaged_metrics WHERE interval_start >= NOW() - INTERVAL '\''6 hours'\''",
+                        "format": "table"
+                      }
+                    ],
+                    "options": {
+                      "colorMode": "value",
+                      "graphMode": "area",
+                      "justifyMode": "auto",
+                      "orientation": "auto",
+                      "reduceOptions": {
+                        "values": false,
+                        "calcs": ["lastNotNull"]
+                      },
+                      "textMode": "auto"
+                    }
+                  },
+                  {
+                    "id": 3,
+                    "type": "stat",
+                    "title": "Total Intervals",
+                    "gridPos": {"h": 3, "w": 6, "x": 12, "y": 0},
+                    "targets": [
+                      {
+                        "refId": "A",
+                        "datasource": {"type": "postgres", "uid": "'$DATASOURCE_UID'"},
+                        "rawSql": "SELECT COUNT(*) as count FROM averaged_metrics WHERE interval_start >= NOW() - INTERVAL '\''6 hours'\''",
+                        "format": "table"
+                      }
+                    ],
+                    "options": {
+                      "colorMode": "none",
+                      "graphMode": "none",
+                      "justifyMode": "auto",
+                      "orientation": "auto",
+                      "reduceOptions": {
+                        "values": false,
+                        "calcs": ["lastNotNull"]
+                      },
+                      "textMode": "auto"
+                    }
+                  },
+                  {
+                    "id": 4,
+                    "type": "timeseries",
+                    "title": "Avg Temperature per Device (5min)",
+                    "gridPos": {"h": 10, "w": 12, "x": 0, "y": 3},
+                    "targets": [
+                      {
+                        "refId": "A",
+                        "datasource": {"type": "postgres", "uid": "'$DATASOURCE_UID'"},
+                        "rawSql": "SELECT interval_start as time, device_id, avg_temperature_c as value FROM averaged_metrics WHERE interval_start >= NOW() - INTERVAL '\''6 hours'\'' AND avg_temperature_c IS NOT NULL ORDER BY interval_start",
+                        "format": "time_series"
+                      }
+                    ],
+                    "options": {
+                      "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "min", "max", "lastNotNull"]},
+                      "tooltip": {"mode": "multi", "sort": "none"}
+                    },
+                    "fieldConfig": {
+                      "defaults": {
+                        "unit": "celsius",
+                        "custom": {"lineWidth": 2, "fillOpacity": 15, "spanNulls": true}
+                      }
+                    }
+                  },
+                  {
+                    "id": 5,
+                    "type": "timeseries",
+                    "title": "Temperature Range per Device (5min)",
+                    "gridPos": {"h": 10, "w": 12, "x": 12, "y": 3},
+                    "targets": [
+                      {
+                        "refId": "A",
+                        "datasource": {"type": "postgres", "uid": "'$DATASOURCE_UID'"},
+                        "rawSql": "SELECT interval_start as time, device_id || '\'' Max'\'' as device_id, max_temperature_c as value FROM averaged_metrics WHERE interval_start >= NOW() - INTERVAL '\''6 hours'\'' AND max_temperature_c IS NOT NULL UNION ALL SELECT interval_start as time, device_id || '\'' Min'\'' as device_id, min_temperature_c as value FROM averaged_metrics WHERE interval_start >= NOW() - INTERVAL '\''6 hours'\'' AND min_temperature_c IS NOT NULL ORDER BY time",
+                        "format": "time_series"
+                      }
+                    ],
+                    "options": {
+                      "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["min", "max"]},
+                      "tooltip": {"mode": "multi", "sort": "none"}
+                    },
+                    "fieldConfig": {
+                      "defaults": {
+                        "unit": "celsius",
+                        "custom": {"lineWidth": 1, "fillOpacity": 5, "spanNulls": true, "lineStyle": {"fill": "dash"}}
+                      }
+                    }
+                  },
+                  {
+                    "id": 6,
+                    "type": "timeseries",
+                    "title": "Avg Humidity per Device (5min)",
+                    "gridPos": {"h": 10, "w": 12, "x": 0, "y": 13},
+                    "targets": [
+                      {
+                        "refId": "A",
+                        "datasource": {"type": "postgres", "uid": "'$DATASOURCE_UID'"},
+                        "rawSql": "SELECT interval_start as time, device_id, avg_humidity_percent as value FROM averaged_metrics WHERE interval_start >= NOW() - INTERVAL '\''6 hours'\'' AND avg_humidity_percent IS NOT NULL ORDER BY interval_start",
+                        "format": "time_series"
+                      }
+                    ],
+                    "options": {
+                      "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "min", "max", "lastNotNull"]},
+                      "tooltip": {"mode": "multi", "sort": "none"}
+                    },
+                    "fieldConfig": {
+                      "defaults": {
+                        "unit": "percent",
+                        "custom": {"lineWidth": 2, "fillOpacity": 15, "spanNulls": true}
+                      }
+                    }
+                  },
+                  {
+                    "id": 7,
+                    "type": "timeseries",
+                    "title": "Humidity Range per Device (5min)",
+                    "gridPos": {"h": 10, "w": 12, "x": 12, "y": 13},
+                    "targets": [
+                      {
+                        "refId": "A",
+                        "datasource": {"type": "postgres", "uid": "'$DATASOURCE_UID'"},
+                        "rawSql": "SELECT interval_start as time, device_id || '\'' Max'\'' as device_id, max_humidity_percent as value FROM averaged_metrics WHERE interval_start >= NOW() - INTERVAL '\''6 hours'\'' AND max_humidity_percent IS NOT NULL UNION ALL SELECT interval_start as time, device_id || '\'' Min'\'' as device_id, min_humidity_percent as value FROM averaged_metrics WHERE interval_start >= NOW() - INTERVAL '\''6 hours'\'' AND min_humidity_percent IS NOT NULL ORDER BY time",
+                        "format": "time_series"
+                      }
+                    ],
+                    "options": {
+                      "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["min", "max"]},
+                      "tooltip": {"mode": "multi", "sort": "none"}
+                    },
+                    "fieldConfig": {
+                      "defaults": {
+                        "unit": "percent",
+                        "custom": {"lineWidth": 1, "fillOpacity": 5, "spanNulls": true, "lineStyle": {"fill": "dash"}}
+                      }
+                    }
+                  },
+                  {
+                    "id": 8,
+                    "type": "timeseries",
+                    "title": "Avg Battery Level per Device (5min)",
+                    "gridPos": {"h": 10, "w": 24, "x": 0, "y": 23},
+                    "targets": [
+                      {
+                        "refId": "A",
+                        "datasource": {"type": "postgres", "uid": "'$DATASOURCE_UID'"},
+                        "rawSql": "SELECT interval_start as time, device_id, avg_battery_level_percent as value FROM averaged_metrics WHERE interval_start >= NOW() - INTERVAL '\''6 hours'\'' AND avg_battery_level_percent IS NOT NULL ORDER BY interval_start",
+                        "format": "time_series"
+                      }
+                    ],
+                    "options": {
+                      "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["min", "mean", "max", "lastNotNull"]},
+                      "tooltip": {"mode": "multi", "sort": "desc"}
+                    },
+                    "fieldConfig": {
+                      "defaults": {
+                        "unit": "percent",
+                        "min": 0,
+                        "max": 100,
+                        "custom": {"lineWidth": 2, "fillOpacity": 15, "spanNulls": true},
+                        "thresholds": {
+                          "mode": "absolute",
+                          "steps": [
+                            {"color": "red", "value": null},
+                            {"color": "orange", "value": 20},
+                            {"color": "yellow", "value": 50},
+                            {"color": "green", "value": 80}
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "id": 9,
+                    "type": "table",
+                    "title": "Device Stats Summary (Last 6h)",
+                    "gridPos": {"h": 8, "w": 24, "x": 0, "y": 33},
+                    "targets": [
+                      {
+                        "refId": "A",
+                        "datasource": {"type": "postgres", "uid": "'$DATASOURCE_UID'"},
+                        "rawSql": "SELECT device_id, ROUND(AVG(avg_temperature_c)::numeric, 1) as avg_temp, MIN(min_temperature_c) as min_temp, MAX(max_temperature_c) as max_temp, ROUND(AVG(avg_humidity_percent)::numeric, 1) as avg_hum, ROUND(AVG(avg_battery_level_percent)::numeric, 1) as avg_batt, MIN(min_battery_level_percent) as min_batt, SUM(sample_count) as total_samples, COUNT(*) as intervals FROM averaged_metrics WHERE interval_start >= NOW() - INTERVAL '\''6 hours'\'' GROUP BY device_id ORDER BY device_id",
+                        "format": "table"
+                      }
+                    ],
+                    "options": {
+                      "showHeader": true,
+                      "sortBy": [{"displayName": "device_id", "desc": false}]
+                    },
+                    "fieldConfig": {
+                      "defaults": {
+                        "custom": {
+                          "displayMode": "color-background"
+                        }
+                      },
+                      "overrides": [
+                        {"matcher": {"id": "byName", "options": "avg_temp"}, "properties": [{"id": "unit", "value": "celsius"}]},
+                        {"matcher": {"id": "byName", "options": "min_temp"}, "properties": [{"id": "unit", "value": "celsius"}, {"id": "color", "value": {"mode": "continuous-GrYlRd"}}]},
+                        {"matcher": {"id": "byName", "options": "max_temp"}, "properties": [{"id": "unit", "value": "celsius"}, {"id": "color", "value": {"mode": "continuous-RdYlGr"}}]},
+                        {"matcher": {"id": "byName", "options": "avg_hum"}, "properties": [{"id": "unit", "value": "percent"}]},
+                        {"matcher": {"id": "byName", "options": "avg_batt"}, "properties": [{"id": "unit", "value": "percent"}, {"id": "min", "value": 0}, {"id": "max", "value": 100}]},
+                        {"matcher": {"id": "byName", "options": "min_batt"}, "properties": [{"id": "unit", "value": "percent"}, {"id": "min", "value": 0}, {"id": "max", "value": 100}, {"id": "color", "value": {"mode": "thresholds"}}]}
+                      ]
+                    }
+                  }
+                ]
+              },
+              "overwrite": true
+            }'
+            
+            echo "Creating dashboard: IoT Devices - Aggregated Metrics (5min)"
+            curl -s -X POST \
+              -H 'Content-Type: application/json' \
+              -d "$DASHBOARD" \
+              http://admin:${var.grafana_admin_password}@localhost:3000/api/dashboards/db
+            
+            # List all dashboards
+            echo "Created dashboards:"
+            curl -s http://admin:${var.grafana_admin_password}@localhost:3000/api/search | jq -r '.[].title'
             
             echo "=== Setup completed ==="
 
