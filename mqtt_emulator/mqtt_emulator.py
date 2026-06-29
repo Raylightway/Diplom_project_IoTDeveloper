@@ -1,26 +1,16 @@
+# mqtt_emulator.py
 import json
 import random
 import math
 import time
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import paho.mqtt.client as mqtt
+import boto3
 
 def handler(event, context):
     """
-    Эмулятор MQTT устройств - отправляет сообщения в Mosquitto брокер
-    
-    Параметры event:
-    - mqtt_host: адрес MQTT брокера
-    - mqtt_port: порт (по умолчанию 1883)
-    - devices: список устройств с firmware_version
-    - topics: список топиков (если не указаны, используются device_id)
-    - count: количество сообщений на устройство
-    - interval: интервал между сообщениями (сек)
-    - temperature_range: [min, max] диапазон температуры
-    - humidity_range: [min, max] диапазон влажности
-    - battery_range: [min, max] диапазон заряда батареи
-    - pattern: паттерн генерации (random, sine, linear, step, sawtooth)
+    Эмулятор MQTT устройств с сохранением состояния батареи в S3 bucket
     """
     
     print("=" * 50)
@@ -40,55 +30,55 @@ def handler(event, context):
             })
         }
     
-    # Параметры устройств (теперь с firmware_version)
-    devices = event.get('devices', [
-        {'device_id': 'sensor_1', 'firmware_version': '1.0.0'},
-        {'device_id': 'sensor_2', 'firmware_version': '1.0.1'},
-        {'device_id': 'sensor_3', 'firmware_version': '1.0.0'}
-    ])
+    # Параметры устройств
+    devices = event.get('devices', ['Device_1', 'Device_2', 'Device_3', 'Device_4'])
+    if devices and isinstance(devices[0], dict):
+        devices = [d['device_id'] if isinstance(d, dict) else d for d in devices]
     
-    # Если devices - список строк, преобразуем в объекты
-    if devices and isinstance(devices[0], str):
-        devices = [{'device_id': d, 'firmware_version': '1.0.0'} for d in devices]
-    
-    topics = event.get('topics', [f"devices/{device['device_id']}" for device in devices])
-    
-    if len(topics) != len(devices):
-        topics = [f"devices/{device['device_id']}" for device in devices]
+    # Параметры батареи
+    battery_config = event.get('battery_config', {
+        'charge_rate': 2.0,      # % в минуту при зарядке
+        'discharge_rate': 1.0,   # % в минуту при разрядке
+        'min_level': 20.0,       # Минимальный уровень
+        'max_level': 90.0,       # Максимальный уровень
+        'default_level': 70.0    # Уровень по умолчанию для новых устройств
+    })
     
     # Параметры отправки
-    count = int(event.get('count', 10))
-    interval = float(event.get('interval', 1.0))
+    count = int(event.get('count', 5))
+    interval = float(event.get('interval', 0.5))
     
-    # Диапазоны для разных метрик
+    # Диапазоны для других метрик
     temperature_range = event.get('temperature_range', [15.0, 35.0])
     humidity_range = event.get('humidity_range', [30.0, 90.0])
-    battery_range = event.get('battery_range', [20.0, 100.0])
-    
     pattern = event.get('pattern', 'random')
     
-    # Дополнительные параметры
-    qos = int(event.get('qos', 0))
-    retain = event.get('retain', False)
-    username = event.get('username', os.environ.get('MQTT_USERNAME'))
-    password = event.get('password', os.environ.get('MQTT_PASSWORD'))
+    # Загружаем состояния батарей из S3 bucket
+    battery_states = load_battery_states_from_s3(devices, battery_config)
     
     print(f"Target: {mqtt_host}:{mqtt_port}")
-    print(f"Devices: {len(devices)}, Messages per device: {count}")
+    print(f"Devices: {devices}")
+    print(f"Battery config: {battery_config}")
     print(f"Pattern: {pattern}")
-    print(f"Temperature range: {temperature_range}")
-    print(f"Humidity range: {humidity_range}")
-    print(f"Battery range: {battery_range}")
+    
+    # Выводим начальные состояния
+    print("\nInitial battery states:")
+    for device_id, state in battery_states.items():
+        print(f"  {device_id}: {state['level']:.1f}% [{'↑ Charging' if state['charging'] else '↓ Discharging'}] "
+              f"(last update: {state.get('last_update', 'N/A')})")
     
     # Создаем MQTT клиент
     client_id = f"emulator_{int(time.time())}_{random.randint(1000, 9999)}"
     client = mqtt.Client(client_id=client_id)
     
-    # Настраиваем аутентификацию если нужно
+    username = event.get('username', os.environ.get('MQTT_USERNAME'))
+    password = event.get('password', os.environ.get('MQTT_PASSWORD'))
     if username and password:
         client.username_pw_set(username, password)
     
-    # Флаги для отслеживания состояния
+    qos = int(event.get('qos', 0))
+    retain = event.get('retain', False)
+    
     connected = False
     messages_sent = 0
     messages_failed = 0
@@ -97,7 +87,7 @@ def handler(event, context):
         nonlocal connected
         if rc == 0:
             connected = True
-            print(f"Connected to {mqtt_host}:{mqtt_port}")
+            print(f"\nConnected to {mqtt_host}:{mqtt_port}")
         else:
             print(f"Connection failed with code {rc}")
     
@@ -108,12 +98,10 @@ def handler(event, context):
     client.on_connect = on_connect
     client.on_publish = on_publish
     
-    # Подключаемся к брокеру
     try:
         client.connect(mqtt_host, mqtt_port, keepalive=60)
         client.loop_start()
         
-        # Ждем подключения
         timeout = 10
         start_time = time.time()
         while not connected and (time.time() - start_time) < timeout:
@@ -127,7 +115,6 @@ def handler(event, context):
                     'message': f'Failed to connect to {mqtt_host}:{mqtt_port}'
                 })
             }
-        
     except Exception as e:
         return {
             'statusCode': 500,
@@ -141,62 +128,60 @@ def handler(event, context):
     results = []
     start_time = time.time()
     
-    for device, topic in zip(devices, topics):
-        device_id = device['device_id']
-        firmware_version = device['firmware_version']
+    for device_id in devices:
+        # Получаем состояние батареи
+        battery_state = battery_states[device_id]
         
         device_result = {
             'device_id': device_id,
-            'firmware_version': firmware_version,
-            'topic': topic,
             'messages_sent': 0,
             'messages_failed': 0,
-            'values': []
+            'battery_levels': []
         }
         
+        topic = f"devices/{device_id}"
+        
         for i in range(count):
-            # Генерируем метрики
-            status = random.choice(['online', 'online', 'online', 'warning', 'error'])  # 60% online
+            # Обновляем уровень батареи
+            battery_level = update_battery_level(battery_state, battery_config, interval)
+            
+            # Генерируем другие метрики
+            status = random.choice(['online', 'online', 'online', 'warning', 'error'])
             
             metrics = {
                 'temperature_c': round(generate_value(pattern, i, count, temperature_range), 2),
                 'humidity_percent': round(generate_value(pattern, i, count, humidity_range), 2),
-                'battery_level_percent': round(generate_value('linear_decrease', i, count, battery_range), 2)
+                'battery_level_percent': round(battery_level, 2)
             }
             
-            # Формируем payload в новом формате
+            # Формируем payload
             payload = {
                 'device_id': device_id,
-                'firmware_version': firmware_version,
+                'firmware_version': '1.0.0',
                 'status': status,
                 'timestamp': datetime.now(timezone.utc).isoformat(),
                 'metrics': metrics
             }
             
             try:
-                # Отправляем в MQTT
-                result = client.publish(
-                    topic,
-                    json.dumps(payload),
-                    qos=qos,
-                    retain=retain
-                )
+                result = client.publish(topic, json.dumps(payload), qos=qos, retain=retain)
                 
                 if result.rc == mqtt.MQTT_ERR_SUCCESS:
                     device_result['messages_sent'] += 1
-                    device_result['values'].append(metrics)
-                    print(f"  ✓ {topic}: temp={metrics['temperature_c']}°C, "
-                          f"hum={metrics['humidity_percent']}%, "
-                          f"bat={metrics['battery_level_percent']}%")
+                    device_result['battery_levels'].append(battery_level)
+                    if i % 5 == 0 or i == count - 1:  # Печатаем каждое 5-е сообщение
+                        print(f"  ✓ {device_id}: bat={battery_level:.1f}% "
+                              f"[{'↑' if battery_state['charging'] else '↓'}] "
+                              f"temp={metrics['temperature_c']}°C "
+                              f"hum={metrics['humidity_percent']}%")
                 else:
                     device_result['messages_failed'] += 1
-                    print(f"  ✗ {topic}: publish failed")
+                    print(f"  ✗ {device_id}: publish failed")
                     
             except Exception as e:
                 device_result['messages_failed'] += 1
-                print(f"  ✗ {topic}: {str(e)}")
+                print(f"  ✗ {device_id}: {str(e)}")
             
-            # Пауза между сообщениями
             if interval > 0 and i < count - 1:
                 time.sleep(interval)
         
@@ -206,9 +191,17 @@ def handler(event, context):
     client.loop_stop()
     client.disconnect()
     
+    # Сохраняем состояния батарей в S3 bucket
+    save_battery_states_to_s3(battery_states)
+    
     elapsed_time = time.time() - start_time
     total_sent = sum(r['messages_sent'] for r in results)
     total_failed = sum(r['messages_failed'] for r in results)
+    
+    # Выводим финальные состояния
+    print("\nFinal battery states (saved to S3):")
+    for device_id, state in battery_states.items():
+        print(f"  {device_id}: {state['level']:.1f}% [{'↑ Charging' if state['charging'] else '↓ Discharging'}]")
     
     print("=" * 50)
     print(f"Emulation completed: {total_sent}/{total_sent + total_failed} messages sent in {elapsed_time:.2f}s")
@@ -224,59 +217,212 @@ def handler(event, context):
                 'total_failed': total_failed,
                 'elapsed_time': round(elapsed_time, 2),
                 'devices': len(devices),
-                'pattern': pattern,
-                'mqtt_host': mqtt_host,
-                'mqtt_port': mqtt_port
+                'pattern': pattern
             },
+            'battery_states': {k: {'level': round(v['level'], 2), 'charging': v['charging']} 
+                              for k, v in battery_states.items()},
             'results': results
         }, default=str)
     }
 
-def generate_value(pattern, index, total, value_range):
+def load_battery_states_from_s3(devices, config):
     """
-    Генерирует значение в зависимости от паттерна
+    Загружает состояния батарей из S3 bucket
+    """
+    states = {}
     
-    Patterns:
-    - random: случайное значение в диапазоне
-    - sine: синусоида
-    - linear: линейное возрастание
-    - linear_decrease: линейное убывание (для батареи)
-    - step: ступенчатая функция
-    - sawtooth: пилообразная волна
+    try:
+        # Пробуем загрузить файл с состояниями
+        saved_states = read_battery_states_file()
+        
+        if saved_states:
+            print(f"Loaded battery states file from S3 (last modified: {saved_states.get('last_modified', 'unknown')})")
+            
+            for device_id in devices:
+                if device_id in saved_states.get('devices', {}):
+                    # Используем сохраненное состояние
+                    device_state = saved_states['devices'][device_id]
+                    last_update = datetime.fromisoformat(device_state['last_update'].replace('Z', '+00:00'))
+                    time_diff = (datetime.now(timezone.utc) - last_update).total_seconds() / 60
+                    
+                    # Применяем изменение за прошедшее время
+                    if time_diff > 0:
+                        if device_state['charging']:
+                            new_level = device_state['level'] + (config['charge_rate'] * time_diff)
+                        else:
+                            new_level = device_state['level'] - (config['discharge_rate'] * time_diff)
+                        
+                        # Ограничиваем диапазоном
+                        new_level = max(config['min_level'], min(config['max_level'], new_level))
+                    else:
+                        new_level = device_state['level']
+                    
+                    states[device_id] = {
+                        'level': new_level,
+                        'charging': device_state['charging'],
+                        'last_update': device_state['last_update']
+                    }
+                    
+                    print(f"  Loaded {device_id}: {new_level:.1f}% "
+                          f"(was {device_state['level']:.1f}% {time_diff:.1f} min ago)")
+                else:
+                    # Новое устройство
+                    states[device_id] = create_initial_state(config)
+                    print(f"  Created {device_id}: {states[device_id]['level']:.1f}% (new device)")
+        else:
+            # Файл не найден, создаем начальные состояния
+            print("No battery states file found in S3, creating initial states")
+            for device_id in devices:
+                states[device_id] = create_initial_state(config)
+                print(f"  Created {device_id}: {states[device_id]['level']:.1f}%")
+    
+    except Exception as e:
+        print(f"Error loading from S3: {e}")
+        # Fallback: создаем состояния по умолчанию
+        for device_id in devices:
+            states[device_id] = create_initial_state(config)
+    
+    return states
+
+def create_initial_state(config):
+    """Создает начальное состояние для устройства"""
+    initial_level = random.uniform(
+        config['min_level'] + 20, 
+        config['max_level'] - 10
+    )
+    return {
+        'level': initial_level,
+        'charging': random.choice([True, False]),
+        'last_update': datetime.now(timezone.utc).isoformat()
+    }
+
+def read_battery_states_file():
     """
+    Читает файл с состояниями батарей из S3 bucket
+    """
+    try:
+        s3 = get_s3_client()
+        bucket_name = os.environ['BUCKET_NAME']
+        
+        try:
+            response = s3.get_object(
+                Bucket=bucket_name,
+                Key='emulator/battery_states.json'
+            )
+            content = json.loads(response['Body'].read())
+            content['last_modified'] = response['LastModified'].isoformat()
+            print(f"Read battery states from s3://{bucket_name}/emulator/battery_states.json")
+            return content
+        except s3.exceptions.NoSuchKey:
+            print(f"File not found: s3://{bucket_name}/emulator/battery_states.json")
+            return None
+        except Exception as e:
+            print(f"Error reading from S3: {e}")
+            return None
+            
+    except Exception as e:
+        print(f"S3 client error: {e}")
+        return None
+
+def save_battery_states_to_s3(states):
+    """
+    Сохраняет состояния батарей в S3 bucket
+    """
+    try:
+        s3 = get_s3_client()
+        bucket_name = os.environ['BUCKET_NAME']
+        
+        # Формируем данные для сохранения
+        data = {
+            'last_updated': datetime.now(timezone.utc).isoformat(),
+            'devices': {}
+        }
+        
+        for device_id, state in states.items():
+            data['devices'][device_id] = {
+                'level': round(state['level'], 2),
+                'charging': state['charging'],
+                'last_update': datetime.now(timezone.utc).isoformat()
+            }
+        
+        # Сохраняем в S3
+        s3.put_object(
+            Bucket=bucket_name,
+            Key='emulator/battery_states.json',
+            Body=json.dumps(data, indent=2),
+            ContentType='application/json'
+        )
+        
+        print(f"Saved battery states to s3://{bucket_name}/emulator/battery_states.json")
+        
+        # Выводим что сохранили
+        for device_id, device_data in data['devices'].items():
+            print(f"  {device_id}: {device_data['level']:.1f}% [{'↑' if device_data['charging'] else '↓'}]")
+        
+    except Exception as e:
+        print(f"Error saving to S3: {e}")
+
+def update_battery_level(state, config, time_delta_minutes):
+    """
+    Обновляет уровень батареи с пилообразным поведением
+    """
+    if state['charging']:
+        # Заряжаем
+        new_level = state['level'] + (config['charge_rate'] * time_delta_minutes)
+        
+        if new_level >= config['max_level']:
+            new_level = config['max_level']
+            state['charging'] = False  # Начинаем разряжать
+            print(f"    ⚡ Battery full ({new_level:.1f}%), starting discharge")
+    else:
+        # Разряжаем
+        new_level = state['level'] - (config['discharge_rate'] * time_delta_minutes)
+        
+        if new_level <= config['min_level']:
+            new_level = config['min_level']
+            state['charging'] = True  # Начинаем заряжать
+            print(f"    🔋 Battery low ({new_level:.1f}%), starting charge")
+    
+    # Добавляем небольшой шум для реалистичности
+    new_level += random.gauss(0, 0.1)
+    new_level = max(config['min_level'], min(config['max_level'], new_level))
+    
+    state['level'] = new_level
+    state['last_update'] = datetime.now(timezone.utc).isoformat()
+    
+    return new_level
+
+def generate_value(pattern, index, total, value_range):
+    """Генерирует значение метрики"""
     min_val, max_val = value_range
     range_size = max_val - min_val
-    mid_val = (min_val + max_val) / 2
     
     if pattern == 'sine':
-        # Синусоида
-        angle = (index / total) * 2 * math.pi
-        value = mid_val + (range_size / 2) * math.sin(angle)
-        
+        angle = (index / max(total, 1)) * 2 * math.pi
+        value = (min_val + max_val) / 2 + (range_size / 2) * math.sin(angle)
     elif pattern == 'linear':
-        # Линейное возрастание
-        value = min_val + (range_size * index / total)
-    
-    elif pattern == 'linear_decrease':
-        # Линейное убывание (для батареи)
-        value = max_val - (range_size * index / total)
-        
+        value = min_val + (range_size * index / max(total, 1))
     elif pattern == 'step':
-        # Ступенчатая функция
         step_size = max(1, total // 5)
         step = index // step_size
         value = min_val + (range_size * step / 4)
-        
     elif pattern == 'sawtooth':
-        # Пилообразная волна
-        period = total / 3
+        period = max(total / 3, 1)
         value = min_val + (range_size * (index % period) / period)
-        
     else:  # random
         value = random.uniform(min_val, max_val)
     
-    # Добавляем небольшой шум для реалистичности
     value += random.gauss(0, range_size * 0.02)
+    return max(min_val, min(max_val, value))
+
+def get_s3_client():
+    """Создает клиент S3 для Yandex Object Storage"""
+    endpoint_url = os.environ.get('STORAGE_ENDPOINT', 'https://storage.yandexcloud.net')
+    aws_access_key_id = os.environ.get('AWS_ACCESS_KEY_ID')
+    aws_secret_access_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
     
-    # Округляем до 2 знаков
-    return round(max(min_val, min(max_val, value)), 2)
+    return boto3.client('s3',
+        endpoint_url=endpoint_url,
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key
+    )
